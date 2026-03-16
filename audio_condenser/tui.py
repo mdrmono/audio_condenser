@@ -10,7 +10,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.suggester import Suggester
-from textual.widgets import Button, Footer, Header, Input, Label, ProgressBar, Static
+from textual.widgets import Button, Footer, Header, Input, Label, Static
 
 from .core import (
     AUDIO_INPUT_SUFFIXES,
@@ -173,17 +173,6 @@ class CondenserTUI(App[None]):
         margin: 0 0 1 0;
     }
 
-    #progress-row {
-        width: 100%;
-        align-horizontal: center;
-        margin: 0 0 1 0;
-    }
-
-    #queue-progress {
-        width: 80%;
-        margin: 0;
-    }
-
     CommandPalette > Vertical {
         margin-top: 0;
         padding-top: 0;
@@ -254,8 +243,6 @@ class CondenserTUI(App[None]):
                     yield Button("Run Queue", id="run-button")
                     yield Button("Stop Queue", id="stop-button")
                     yield Button("Force Stop", id="force-stop-button")
-                with Horizontal(id="progress-row"):
-                    yield ProgressBar(total=1, id="queue-progress", show_eta=False)
                 yield Label("Queue workers")
                 yield Input(
                     value=str(self._default_worker_count()),
@@ -305,7 +292,6 @@ class CondenserTUI(App[None]):
     def on_mount(self) -> None:
         self._refresh_queue_view()
         self._refresh_audio_preview()
-        self._reset_progress(0)
         self._set_status("idle")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -680,7 +666,6 @@ class CondenserTUI(App[None]):
             return
         self.running = True
         self.stop_requested = False
-        self._reset_progress(len(self.queue))
         self._process_queue_worker(list(zip(self.queue, configs)), worker_count)
 
     def _stop_queue(self) -> None:
@@ -728,13 +713,6 @@ class CondenserTUI(App[None]):
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status", Static).update(f"Status: {text}")
-
-    def _reset_progress(self, total: int) -> None:
-        progress = self.query_one("#queue-progress", ProgressBar)
-        progress.update(total=max(1, total), progress=0)
-
-    def _advance_progress(self) -> None:
-        self.query_one("#queue-progress", ProgressBar).advance(1)
 
     @staticmethod
     def _job_key(input_path: Path) -> str:
@@ -862,12 +840,10 @@ class CondenserTUI(App[None]):
                             error=str(exc),
                         )
                     self.call_from_thread(self._finish_job, index, result)
-                    self.call_from_thread(self._advance_progress)
 
         if self.stop_requested and pending_index < len(jobs):
             for index in range(pending_index, len(jobs)):
                 self.call_from_thread(self._mark_stopped, index, "not started")
-                self.call_from_thread(self._advance_progress)
 
         final_message = "Queue stopped." if self.stop_requested else "Queue finished."
         self.call_from_thread(self._set_status, "idle")
