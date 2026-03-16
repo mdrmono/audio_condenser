@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from .core import (
     AUDIO_INPUT_SUFFIXES,
     CondenserError,
     build_preview,
+    cancel_jobs,
     check_dependencies,
     process_file,
     resolve_subtitle_path,
@@ -171,6 +173,17 @@ class CondenserTUI(App[None]):
         margin: 0 0 1 0;
     }
 
+    #progress-row {
+        width: 100%;
+        align-horizontal: center;
+        margin: 0 0 1 0;
+    }
+
+    #queue-progress {
+        width: 80%;
+        margin: 0;
+    }
+
     CommandPalette > Vertical {
         margin-top: 0;
         padding-top: 0;
@@ -205,6 +218,9 @@ class CondenserTUI(App[None]):
         self.selected_index = 0
         self.log_lines: list[str] = []
         self.running = False
+        self.stop_requested = False
+        self._active_job_keys: set[str] = set()
+        self._active_job_keys_lock = threading.Lock()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -236,7 +252,10 @@ class CondenserTUI(App[None]):
                 with Horizontal(id="run-actions", classes="button-row"):
                     yield Button("Preview Input", id="preview-button")
                     yield Button("Run Queue", id="run-button")
-                yield ProgressBar(total=1, id="queue-progress", show_eta=False)
+                    yield Button("Stop Queue", id="stop-button")
+                    yield Button("Force Stop", id="force-stop-button")
+                with Horizontal(id="progress-row"):
+                    yield ProgressBar(total=1, id="queue-progress", show_eta=False)
                 yield Label("Queue workers")
                 yield Input(
                     value=str(self._default_worker_count()),
@@ -305,6 +324,10 @@ class CondenserTUI(App[None]):
             self._preview_current_target()
         elif button_id == "run-button":
             self._run_queue()
+        elif button_id == "stop-button":
+            self._stop_queue()
+        elif button_id == "force-stop-button":
+            self._force_stop_queue()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id in {"audio-path", "srt-path"}:
@@ -656,8 +679,31 @@ class CondenserTUI(App[None]):
             self._set_status("blocked")
             return
         self.running = True
+        self.stop_requested = False
         self._reset_progress(len(self.queue))
         self._process_queue_worker(list(zip(self.queue, configs)), worker_count)
+
+    def _stop_queue(self) -> None:
+        if not self.running:
+            self._append_log("Queue is not running.")
+            return
+        self.stop_requested = True
+        self._set_status("stopping after active jobs finish")
+        self._append_log("Stop requested. No new jobs will start.")
+
+    def _force_stop_queue(self) -> None:
+        if not self.running:
+            self._append_log("Queue is not running.")
+            return
+        self.stop_requested = True
+        active_job_keys = self._snapshot_active_job_keys()
+        if active_job_keys:
+            cancel_jobs(active_job_keys)
+            self._set_status("force stopping active jobs")
+            self._append_log("Force stop requested. Active jobs are being terminated.")
+        else:
+            self._set_status("stopping queued jobs")
+            self._append_log("Force stop requested. No active jobs; queued jobs will not start.")
 
     def _selected_item(self) -> QueueItem | None:
         if not self.queue:
@@ -690,6 +736,28 @@ class CondenserTUI(App[None]):
     def _advance_progress(self) -> None:
         self.query_one("#queue-progress", ProgressBar).advance(1)
 
+    @staticmethod
+    def _job_key(input_path: Path) -> str:
+        return str(input_path)
+
+    def _mark_stopped(self, index: int, reason: str) -> None:
+        item = self.queue[index]
+        item.status = "stopped"
+        item.message = reason
+        self._refresh_queue_view()
+
+    def _track_active_job(self, job_key: str) -> None:
+        with self._active_job_keys_lock:
+            self._active_job_keys.add(job_key)
+
+    def _untrack_active_job(self, job_key: str) -> None:
+        with self._active_job_keys_lock:
+            self._active_job_keys.discard(job_key)
+
+    def _snapshot_active_job_keys(self) -> list[str]:
+        with self._active_job_keys_lock:
+            return list(self._active_job_keys)
+
     def _append_log(self, text: str) -> None:
         self.log_lines.append(text)
         if len(self.log_lines) > 12:
@@ -719,6 +787,10 @@ class CondenserTUI(App[None]):
             self._append_log(
                 f"{item.input_path.name} -> {result.output_path} ({result.source}, {len(result.segments)} segments)"
             )
+        elif result.error == "Processing canceled.":
+            item.status = "stopped"
+            item.message = "canceled"
+            self._append_log(f"{item.input_path.name} stopped.")
         else:
             item.status = "failed"
             item.message = result.error or "unknown error"
@@ -750,10 +822,16 @@ class CondenserTUI(App[None]):
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             while pending_index < len(jobs) or futures:
-                while pending_index < len(jobs) and len(futures) < max_workers:
+                while (
+                    not self.stop_requested
+                    and pending_index < len(jobs)
+                    and len(futures) < max_workers
+                ):
                     item, config = jobs[pending_index]
-                    future = executor.submit(process_file, item.input_path, config)
-                    futures[future] = pending_index
+                    job_key = self._job_key(item.input_path)
+                    future = executor.submit(process_file, item.input_path, config, job_key)
+                    futures[future] = (pending_index, job_key)
+                    self._track_active_job(job_key)
                     self.call_from_thread(self._mark_running, pending_index)
                     self.call_from_thread(
                         self._set_status,
@@ -761,9 +839,13 @@ class CondenserTUI(App[None]):
                     )
                     pending_index += 1
 
+                if not futures:
+                    break
+
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in done:
-                    index = futures.pop(future)
+                    index, job_key = futures.pop(future)
+                    self._untrack_active_job(job_key)
                     item, _ = jobs[index]
                     try:
                         result = future.result()
@@ -782,9 +864,16 @@ class CondenserTUI(App[None]):
                     self.call_from_thread(self._finish_job, index, result)
                     self.call_from_thread(self._advance_progress)
 
+        if self.stop_requested and pending_index < len(jobs):
+            for index in range(pending_index, len(jobs)):
+                self.call_from_thread(self._mark_stopped, index, "not started")
+                self.call_from_thread(self._advance_progress)
+
+        final_message = "Queue stopped." if self.stop_requested else "Queue finished."
         self.call_from_thread(self._set_status, "idle")
-        self.call_from_thread(self._append_log, "Queue finished.")
+        self.call_from_thread(self._append_log, final_message)
         self.running = False
+        self.stop_requested = False
 
     def _mark_running(self, index: int) -> None:
         self.queue[index].status = "running"

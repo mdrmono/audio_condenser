@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from array import array
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from .models import JobResult, PreviewData, ProcessingConfig, Segment
 from .subtitles import auto_pair_subtitle, merge_segments, normalize_subtitle_segments, parse_srt
@@ -13,9 +13,16 @@ from .subtitles import auto_pair_subtitle, merge_segments, normalize_subtitle_se
 AUDIO_INPUT_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 OUTPUT_FORMATS = {"mp3", "wav", "m4a"}
 AMPLITUDE_CHARS = " .:-=+*#%@"
+_PROCESS_LOCK = threading.Lock()
+_RUNNING_PROCESSES: dict[str, list[subprocess.Popen]] = {}
+_CANCELED_JOBS: set[str] = set()
 
 
 class CondenserError(RuntimeError):
+    pass
+
+
+class CancellationRequested(CondenserError):
     pass
 
 
@@ -31,37 +38,48 @@ def check_dependencies() -> dict[str, str]:
     return {"ffmpeg": ffmpeg or "", "ffprobe": ffprobe or ""}
 
 
-def process_file(input_path: Path, config: ProcessingConfig) -> JobResult:
-    duration = probe_duration(input_path)
-    segments, source = plan_segments(input_path, duration, config)
-    if not segments:
-        raise CondenserError(f"No spoken segments found for {input_path}")
+def process_file(
+    input_path: Path, config: ProcessingConfig, job_key: str | None = None
+) -> JobResult:
+    job_key = job_key or str(input_path)
+    _clear_cancellation(job_key)
+    try:
+        _ensure_not_canceled(job_key)
+        duration = probe_duration(input_path, job_key=job_key)
+        _ensure_not_canceled(job_key)
+        segments, source = plan_segments(input_path, duration, config, job_key=job_key)
+        if not segments:
+            raise CondenserError(f"No spoken segments found for {input_path}")
 
-    output_format = choose_output_format(input_path, config.output_format)
-    output_path = build_output_path(input_path, config.output_dir, output_format)
-    render_condensed_audio(input_path, output_path, segments, output_format)
+        output_format = choose_output_format(input_path, config.output_format)
+        output_path = build_output_path(input_path, config.output_dir, output_format)
+        _ensure_not_canceled(job_key)
+        render_condensed_audio(input_path, output_path, segments, output_format, job_key=job_key)
+        _ensure_not_canceled(job_key)
 
-    condensed_duration = round(sum(segment.duration for segment in segments), 3)
-    report_path = write_report(
-        input_path=input_path,
-        output_path=output_path,
-        duration=duration,
-        condensed_duration=condensed_duration,
-        source=source,
-        config=config,
-        segments=segments,
-    )
+        condensed_duration = round(sum(segment.duration for segment in segments), 3)
+        report_path = write_report(
+            input_path=input_path,
+            output_path=output_path,
+            duration=duration,
+            condensed_duration=condensed_duration,
+            source=source,
+            config=config,
+            segments=segments,
+        )
 
-    return JobResult(
-        input_path=input_path,
-        output_path=output_path,
-        report_path=report_path,
-        source=source,
-        original_duration=duration,
-        condensed_duration=condensed_duration,
-        segments=segments,
-        success=True,
-    )
+        return JobResult(
+            input_path=input_path,
+            output_path=output_path,
+            report_path=report_path,
+            source=source,
+            original_duration=duration,
+            condensed_duration=condensed_duration,
+            segments=segments,
+            success=True,
+        )
+    finally:
+        _clear_cancellation(job_key)
 
 
 def build_preview(input_path: Path, config: ProcessingConfig, columns: int = 72) -> PreviewData:
@@ -78,7 +96,7 @@ def build_preview(input_path: Path, config: ProcessingConfig, columns: int = 72)
     )
 
 
-def probe_duration(input_path: Path) -> float:
+def probe_duration(input_path: Path, job_key: str | None = None) -> float:
     command = [
         "ffprobe",
         "-v",
@@ -89,7 +107,7 @@ def probe_duration(input_path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(input_path),
     ]
-    completed = run_command(command)
+    completed = run_command(command, job_key=job_key)
     try:
         duration = float(completed.stdout.strip())
     except ValueError as exc:
@@ -97,7 +115,9 @@ def probe_duration(input_path: Path) -> float:
     return round(duration, 3)
 
 
-def plan_segments(input_path: Path, duration: float, config: ProcessingConfig) -> tuple[list[Segment], str]:
+def plan_segments(
+    input_path: Path, duration: float, config: ProcessingConfig, job_key: str | None = None
+) -> tuple[list[Segment], str]:
     subtitle_path = resolve_subtitle_path(input_path, config.subtitle_path)
     if subtitle_path is not None:
         subtitle_segments = parse_srt(subtitle_path)
@@ -119,6 +139,7 @@ def plan_segments(input_path: Path, duration: float, config: ProcessingConfig) -
         merge_gap_ms=config.merge_gap_ms,
         silence_threshold_db=config.silence_threshold_db,
         min_silence_sec=config.min_silence_sec,
+        job_key=job_key,
     )
     return silence_segments, "silence:fallback"
 
@@ -136,8 +157,11 @@ def build_segments_from_silence(
     merge_gap_ms: int,
     silence_threshold_db: int,
     min_silence_sec: float,
+    job_key: str | None = None,
 ) -> list[Segment]:
-    silent_ranges = detect_silence(input_path, silence_threshold_db, min_silence_sec)
+    silent_ranges = detect_silence(
+        input_path, silence_threshold_db, min_silence_sec, job_key=job_key
+    )
     if not silent_ranges:
         return [Segment(start=0.0, end=duration)]
 
@@ -161,7 +185,10 @@ def build_segments_from_silence(
 
 
 def detect_silence(
-    input_path: Path, silence_threshold_db: int, min_silence_sec: float
+    input_path: Path,
+    silence_threshold_db: int,
+    min_silence_sec: float,
+    job_key: str | None = None,
 ) -> list[tuple[float, float]]:
     command = [
         "ffmpeg",
@@ -174,7 +201,7 @@ def detect_silence(
         "null",
         "-",
     ]
-    completed = run_command(command, check=False)
+    completed = run_command(command, check=False, job_key=job_key)
 
     silence_starts: list[float] = []
     silent_ranges: list[tuple[float, float]] = []
@@ -209,7 +236,11 @@ def build_output_path(input_path: Path, output_dir: Path, output_format: str) ->
 
 
 def render_condensed_audio(
-    input_path: Path, output_path: Path, segments: list[Segment], output_format: str
+    input_path: Path,
+    output_path: Path,
+    segments: list[Segment],
+    output_format: str,
+    job_key: str | None = None,
 ) -> None:
     if len(segments) == 1:
         filter_complex = (
@@ -247,7 +278,7 @@ def render_condensed_audio(
         *codec_args,
         str(output_path),
     ]
-    run_command(command)
+    run_command(command, job_key=job_key)
 
 
 def write_report(
@@ -331,15 +362,80 @@ def render_timeline(duration: float, segments: list[Segment], columns: int = 72)
     return "".join(timeline)
 
 
+def cancel_jobs(job_keys: list[str]) -> None:
+    processes_to_stop: list[subprocess.Popen] = []
+    with _PROCESS_LOCK:
+        for job_key in job_keys:
+            _CANCELED_JOBS.add(job_key)
+            processes_to_stop.extend(_RUNNING_PROCESSES.get(job_key, []))
+
+    for process in processes_to_stop:
+        if process.poll() is not None:
+            continue
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
+def _register_process(job_key: str | None, process: subprocess.Popen) -> None:
+    if job_key is None:
+        return
+    with _PROCESS_LOCK:
+        _RUNNING_PROCESSES.setdefault(job_key, []).append(process)
+
+
+def _unregister_process(job_key: str | None, process: subprocess.Popen) -> None:
+    if job_key is None:
+        return
+    with _PROCESS_LOCK:
+        processes = _RUNNING_PROCESSES.get(job_key)
+        if not processes:
+            return
+        if process in processes:
+            processes.remove(process)
+        if not processes:
+            _RUNNING_PROCESSES.pop(job_key, None)
+
+
+def _clear_cancellation(job_key: str | None) -> None:
+    if job_key is None:
+        return
+    with _PROCESS_LOCK:
+        _CANCELED_JOBS.discard(job_key)
+
+
+def _ensure_not_canceled(job_key: str | None) -> None:
+    if job_key is None:
+        return
+    with _PROCESS_LOCK:
+        canceled = job_key in _CANCELED_JOBS
+    if canceled:
+        raise CancellationRequested("Processing canceled.")
+
+
 def run_command(
-    command: list[str], check: bool = True, text: bool = True
+    command: list[str],
+    check: bool = True,
+    text: bool = True,
+    job_key: str | None = None,
 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
-    completed = subprocess.run(
+    _ensure_not_canceled(job_key)
+    process = subprocess.Popen(
         command,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=text,
-        check=False,
     )
+    _register_process(job_key, process)
+    try:
+        stdout, stderr = process.communicate()
+    finally:
+        _unregister_process(job_key, process)
+
+    _ensure_not_canceled(job_key)
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if check and completed.returncode != 0:
         stderr = completed.stderr.decode("utf-8", errors="ignore") if isinstance(completed.stderr, bytes) else completed.stderr
         raise CondenserError(stderr.strip() or f"Command failed: {' '.join(command)}")
