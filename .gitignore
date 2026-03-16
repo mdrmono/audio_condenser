@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+*.condensed.mp3
+*.condensed.wav
+*.condensed.m4a
+*.condensed.*.json
