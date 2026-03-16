@@ -18,6 +18,7 @@ from .core import (
     build_preview,
     cancel_jobs,
     check_dependencies,
+    normalize_processing_mode,
     process_file,
     resolve_subtitle_path,
 )
@@ -250,6 +251,16 @@ class CondenserTUI(App[None]):
                     placeholder="Files to process in parallel",
                 )
                 yield Static("How many audio files to process at the same time. Higher values use more CPU.", classes="hint")
+                yield Label("FFmpeg threads per job")
+                yield Input(
+                    value=str(self._default_ffmpeg_threads()),
+                    id="ffmpeg-threads",
+                    placeholder="Threads passed to each ffmpeg process",
+                )
+                yield Static(
+                    "Caps the CPU threads used by each ffmpeg job. Keep this low when processing multiple files.",
+                    classes="hint",
+                )
                 yield Label("Output directory")
                 yield Input(
                     value=str(Path.cwd()),
@@ -272,6 +283,16 @@ class CondenserTUI(App[None]):
                 yield Label("Export format")
                 yield Input(value="auto", id="format", placeholder="auto, m4a, mp3, or wav")
                 yield Static("Use auto to keep m4a or wav when possible and otherwise export mp3.", classes="hint")
+                yield Label("Processing mode")
+                yield Input(
+                    value=self._default_processing_mode(),
+                    id="processing-mode",
+                    placeholder="accurate or fast",
+                )
+                yield Static(
+                    "accurate re-encodes for precise cuts. fast stream-copies matching mp3, m4a, or wav outputs for speed.",
+                    classes="hint",
+                )
                 yield Label("Subtitle padding (ms)")
                 yield Input(value="120", id="subtitle-padding", placeholder="Milliseconds added around each subtitle segment")
                 yield Static("Adds a little context before and after each subtitle timestamp.", classes="hint")
@@ -349,6 +370,8 @@ class CondenserTUI(App[None]):
             output_dir=output_dir,
             output_format=output_format,
             subtitle_path=subtitle_override,
+            processing_mode=self._current_processing_mode(),
+            ffmpeg_threads=self._current_ffmpeg_threads(),
             subtitle_padding_ms=int(self.query_one("#subtitle-padding", Input).value.strip()),
             merge_gap_ms=int(self.query_one("#merge-gap", Input).value.strip()),
             silence_threshold_db=int(self.query_one("#silence-threshold", Input).value.strip()),
@@ -358,7 +381,15 @@ class CondenserTUI(App[None]):
     @staticmethod
     def _default_worker_count() -> int:
         cpu_count = os.cpu_count() or 2
-        return max(1, min(4, cpu_count // 2 or 1))
+        return max(1, min(2, cpu_count // 4 or 1))
+
+    @staticmethod
+    def _default_processing_mode() -> str:
+        return "accurate"
+
+    @staticmethod
+    def _default_ffmpeg_threads() -> int:
+        return 1
 
     def _current_worker_count(self) -> int:
         raw_value = self.query_one("#workers", Input).value.strip()
@@ -369,6 +400,25 @@ class CondenserTUI(App[None]):
         if worker_count < 1:
             raise ValueError("Queue workers must be at least 1.")
         return worker_count
+
+    def _current_processing_mode(self) -> str:
+        raw_value = self.query_one("#processing-mode", Input).value.strip()
+        if not raw_value:
+            raise ValueError("Processing mode is required.")
+        try:
+            return normalize_processing_mode(raw_value)
+        except CondenserError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _current_ffmpeg_threads(self) -> int:
+        raw_value = self.query_one("#ffmpeg-threads", Input).value.strip()
+        try:
+            ffmpeg_threads = int(raw_value)
+        except ValueError as exc:
+            raise ValueError("FFmpeg threads must be an integer.") from exc
+        if ffmpeg_threads < 1:
+            raise ValueError("FFmpeg threads must be at least 1.")
+        return ffmpeg_threads
 
     def _current_subtitle_directory(self, validate: bool = False) -> Path | None:
         subtitle_dir_value = self.query_one("#subtitle-dir", Input).value.strip()

@@ -6,13 +6,17 @@ import subprocess
 import threading
 from array import array
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .models import JobResult, PreviewData, ProcessingConfig, Segment
 from .subtitles import auto_pair_subtitle, merge_segments, normalize_subtitle_segments, parse_srt
 
 AUDIO_INPUT_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 OUTPUT_FORMATS = {"mp3", "wav", "m4a"}
+PROCESSING_MODES = {"accurate", "fast"}
 AMPLITUDE_CHARS = " .:-=+*#%@"
+SILENCE_DETECTION_SAMPLE_RATE = 16000
+FAST_COPY_EPSILON = 0.001
 _PROCESS_LOCK = threading.Lock()
 _RUNNING_PROCESSES: dict[str, list[subprocess.Popen]] = {}
 _CANCELED_JOBS: set[str] = set()
@@ -42,6 +46,7 @@ def process_file(
     input_path: Path, config: ProcessingConfig, job_key: str | None = None
 ) -> JobResult:
     job_key = job_key or str(input_path)
+    processing_mode = normalize_processing_mode(config.processing_mode)
     _clear_cancellation(job_key)
     try:
         _ensure_not_canceled(job_key)
@@ -54,7 +59,16 @@ def process_file(
         output_format = choose_output_format(input_path, config.output_format)
         output_path = build_output_path(input_path, config.output_dir, output_format)
         _ensure_not_canceled(job_key)
-        render_condensed_audio(input_path, output_path, segments, output_format, job_key=job_key)
+        render_condensed_audio(
+            input_path,
+            output_path,
+            duration,
+            segments,
+            output_format,
+            processing_mode=processing_mode,
+            ffmpeg_threads=config.ffmpeg_threads,
+            job_key=job_key,
+        )
         _ensure_not_canceled(job_key)
 
         condensed_duration = round(sum(segment.duration for segment in segments), 3)
@@ -85,7 +99,7 @@ def process_file(
 def build_preview(input_path: Path, config: ProcessingConfig, columns: int = 72) -> PreviewData:
     duration = probe_duration(input_path)
     segments, source = plan_segments(input_path, duration, config)
-    waveform = sample_waveform(input_path, columns=columns)
+    waveform = sample_waveform(input_path, columns=columns, ffmpeg_threads=config.ffmpeg_threads)
     timeline = render_timeline(duration, segments, columns=columns)
     return PreviewData(
         source=source,
@@ -139,6 +153,7 @@ def plan_segments(
         merge_gap_ms=config.merge_gap_ms,
         silence_threshold_db=config.silence_threshold_db,
         min_silence_sec=config.min_silence_sec,
+        ffmpeg_threads=config.ffmpeg_threads,
         job_key=job_key,
     )
     return silence_segments, "silence:fallback"
@@ -157,10 +172,15 @@ def build_segments_from_silence(
     merge_gap_ms: int,
     silence_threshold_db: int,
     min_silence_sec: float,
+    ffmpeg_threads: int,
     job_key: str | None = None,
 ) -> list[Segment]:
     silent_ranges = detect_silence(
-        input_path, silence_threshold_db, min_silence_sec, job_key=job_key
+        input_path,
+        silence_threshold_db,
+        min_silence_sec,
+        ffmpeg_threads=ffmpeg_threads,
+        job_key=job_key,
     )
     if not silent_ranges:
         return [Segment(start=0.0, end=duration)]
@@ -188,15 +208,30 @@ def detect_silence(
     input_path: Path,
     silence_threshold_db: int,
     min_silence_sec: float,
+    ffmpeg_threads: int,
     job_key: str | None = None,
 ) -> list[tuple[float, float]]:
+    detection_filter = (
+        "aformat="
+        f"channel_layouts=mono:sample_rates={SILENCE_DETECTION_SAMPLE_RATE},"
+        f"silencedetect=noise={silence_threshold_db}dB:d={min_silence_sec}"
+    )
     command = [
         "ffmpeg",
         "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "info",
+        *_ffmpeg_thread_args(ffmpeg_threads),
         "-i",
         str(input_path),
+        "-vn",
+        "-sn",
+        "-dn",
+        "-map",
+        "0:a:0",
         "-af",
-        f"silencedetect=noise={silence_threshold_db}dB:d={min_silence_sec}",
+        detection_filter,
         "-f",
         "null",
         "-",
@@ -238,8 +273,41 @@ def build_output_path(input_path: Path, output_dir: Path, output_format: str) ->
 def render_condensed_audio(
     input_path: Path,
     output_path: Path,
+    duration: float,
     segments: list[Segment],
     output_format: str,
+    processing_mode: str,
+    ffmpeg_threads: int,
+    job_key: str | None = None,
+) -> None:
+    normalized_mode = normalize_processing_mode(processing_mode)
+    if normalized_mode == "accurate":
+        _render_condensed_audio_accurate(
+            input_path,
+            output_path,
+            segments,
+            output_format,
+            ffmpeg_threads=ffmpeg_threads,
+            job_key=job_key,
+        )
+        return
+    _render_condensed_audio_fast(
+        input_path,
+        output_path,
+        duration,
+        segments,
+        output_format,
+        ffmpeg_threads=ffmpeg_threads,
+        job_key=job_key,
+    )
+
+
+def _render_condensed_audio_accurate(
+    input_path: Path,
+    output_path: Path,
+    segments: list[Segment],
+    output_format: str,
+    ffmpeg_threads: int,
     job_key: str | None = None,
 ) -> None:
     if len(segments) == 1:
@@ -268,7 +336,11 @@ def render_condensed_audio(
     command = [
         "ffmpeg",
         "-hide_banner",
+        "-nostats",
+        "-loglevel",
+        "error",
         "-y",
+        *_ffmpeg_thread_args(ffmpeg_threads),
         "-i",
         str(input_path),
         "-filter_complex",
@@ -279,6 +351,133 @@ def render_condensed_audio(
         str(output_path),
     ]
     run_command(command, job_key=job_key)
+
+
+def _render_condensed_audio_fast(
+    input_path: Path,
+    output_path: Path,
+    duration: float,
+    segments: list[Segment],
+    output_format: str,
+    ffmpeg_threads: int,
+    job_key: str | None = None,
+) -> None:
+    _ensure_fast_copy_supported(input_path, output_format)
+
+    if len(segments) == 1:
+        segment = segments[0]
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-y",
+            *_ffmpeg_thread_args(ffmpeg_threads),
+            "-ss",
+            f"{segment.start:.3f}",
+            "-to",
+            f"{segment.end:.3f}",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-sn",
+            "-dn",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            *_container_output_args(output_format),
+            str(output_path),
+        ]
+        run_command(command, job_key=job_key)
+        return
+
+    split_points = _fast_copy_split_points(segments, duration)
+    if not split_points:
+        command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-y",
+            *_ffmpeg_thread_args(ffmpeg_threads),
+            "-i",
+            str(input_path),
+            "-vn",
+            "-sn",
+            "-dn",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            *_container_output_args(output_format),
+            str(output_path),
+        ]
+        run_command(command, job_key=job_key)
+        return
+
+    with TemporaryDirectory(prefix="audio-condenser-", dir=output_path.parent) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        segment_pattern = temp_dir / f"segment-%04d.{output_format}"
+        split_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-y",
+            *_ffmpeg_thread_args(ffmpeg_threads),
+            "-i",
+            str(input_path),
+            "-vn",
+            "-sn",
+            "-dn",
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "segment",
+            "-segment_times",
+            ",".join(f"{split_point:.3f}" for split_point in split_points),
+            "-reset_timestamps",
+            "1",
+            str(segment_pattern),
+        ]
+        run_command(split_command, job_key=job_key)
+
+        segment_files = sorted(temp_dir.glob(f"segment-*.{output_format}"))
+        kept_files = _fast_copy_kept_files(segment_files, keep_first=segments[0].start <= FAST_COPY_EPSILON)
+        if not kept_files:
+            raise CondenserError(f"Fast mode did not produce any output segments for {input_path}")
+
+        concat_list_path = temp_dir / "segments.txt"
+        concat_list_path.write_text(
+            "\n".join(_concat_file_entry(path) for path in kept_files) + "\n",
+            encoding="utf-8",
+        )
+        concat_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-loglevel",
+            "error",
+            "-y",
+            *_ffmpeg_thread_args(ffmpeg_threads),
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list_path),
+            "-c",
+            "copy",
+            *_container_output_args(output_format),
+            str(output_path),
+        ]
+        run_command(concat_command, job_key=job_key)
 
 
 def write_report(
@@ -301,6 +500,8 @@ def write_report(
         "reduction_percent": reduction_percent,
         "settings": {
             "output_format": output_path.suffix.lstrip("."),
+            "processing_mode": normalize_processing_mode(config.processing_mode),
+            "ffmpeg_threads": config.ffmpeg_threads,
             "subtitle_padding_ms": config.subtitle_padding_ms,
             "merge_gap_ms": config.merge_gap_ms,
             "silence_threshold_db": config.silence_threshold_db,
@@ -312,13 +513,19 @@ def write_report(
     return report_path
 
 
-def sample_waveform(input_path: Path, columns: int = 72) -> str:
+def sample_waveform(input_path: Path, columns: int = 72, ffmpeg_threads: int = 1) -> str:
     command = [
         "ffmpeg",
+        "-hide_banner",
+        "-nostats",
         "-v",
         "error",
+        *_ffmpeg_thread_args(ffmpeg_threads),
         "-i",
         str(input_path),
+        "-vn",
+        "-sn",
+        "-dn",
         "-ac",
         "1",
         "-ar",
@@ -413,6 +620,69 @@ def _ensure_not_canceled(job_key: str | None) -> None:
         canceled = job_key in _CANCELED_JOBS
     if canceled:
         raise CancellationRequested("Processing canceled.")
+
+
+def normalize_processing_mode(processing_mode: str) -> str:
+    normalized = processing_mode.strip().lower()
+    if normalized not in PROCESSING_MODES:
+        supported = ", ".join(sorted(PROCESSING_MODES))
+        raise CondenserError(f"Unsupported processing mode: {processing_mode}. Expected one of: {supported}.")
+    return normalized
+
+
+def _ensure_fast_copy_supported(input_path: Path, output_format: str) -> None:
+    input_format = input_path.suffix.lower().lstrip(".")
+    if input_format not in OUTPUT_FORMATS:
+        raise CondenserError(
+            f"Fast mode is only supported for mp3, m4a, or wav inputs. Use accurate mode for {input_path.suffix or 'this file'}."
+        )
+    if input_format != output_format:
+        raise CondenserError(
+            f"Fast mode requires the output format to match the input container ({input_format} -> {output_format} is not supported)."
+        )
+
+
+def _fast_copy_split_points(segments: list[Segment], duration: float) -> list[float]:
+    split_points: list[float] = []
+    for segment in segments:
+        if segment.start > FAST_COPY_EPSILON:
+            split_points.append(segment.start)
+        if segment.end < duration - FAST_COPY_EPSILON:
+            split_points.append(segment.end)
+
+    deduped: list[float] = []
+    for split_point in sorted(split_points):
+        if deduped and abs(split_point - deduped[-1]) <= FAST_COPY_EPSILON:
+            continue
+        deduped.append(split_point)
+    return deduped
+
+
+def _fast_copy_kept_files(segment_files: list[Path], keep_first: bool) -> list[Path]:
+    keep_current = keep_first
+    kept_files: list[Path] = []
+    for segment_file in segment_files:
+        if keep_current:
+            kept_files.append(segment_file)
+        keep_current = not keep_current
+    return kept_files
+
+
+def _concat_file_entry(path: Path) -> str:
+    escaped = str(path.resolve()).replace("'", r"'\''")
+    return f"file '{escaped}'"
+
+
+def _container_output_args(output_format: str) -> list[str]:
+    if output_format == "m4a":
+        return ["-movflags", "+faststart"]
+    return []
+
+
+def _ffmpeg_thread_args(ffmpeg_threads: int) -> list[str]:
+    if ffmpeg_threads < 1:
+        raise CondenserError("FFmpeg threads must be at least 1.")
+    return ["-threads", str(ffmpeg_threads), "-filter_threads", str(ffmpeg_threads)]
 
 
 def run_command(

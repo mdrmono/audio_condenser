@@ -26,6 +26,8 @@ class ProcessingConfig:
     output_dir: Path
     output_format: str | None = None
     subtitle_path: Path | None = None
+    processing_mode: str = "accurate"
+    ffmpeg_threads: int = 1
     subtitle_padding_ms: int = 120
     merge_gap_ms: int = 220
     silence_threshold_db: int = -35

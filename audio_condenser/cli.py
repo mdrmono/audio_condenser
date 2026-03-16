@@ -4,7 +4,7 @@ from pathlib import Path
 
 import typer
 
-from .core import AUDIO_INPUT_SUFFIXES, CondenserError, check_dependencies, process_file
+from .core import AUDIO_INPUT_SUFFIXES, CondenserError, check_dependencies, normalize_processing_mode, process_file
 from .models import ProcessingConfig
 from .tui import CondenserTUI
 
@@ -37,6 +37,13 @@ def run(
     output_dir: Path = typer.Option(Path("output"), "--output-dir", help="Directory for condensed files."),
     format: str = typer.Option("auto", "--format", help="auto, m4a, mp3, or wav."),
     srt: Path | None = typer.Option(None, "--srt", help="Explicit subtitle file for a single input."),
+    mode: str = typer.Option("accurate", "--mode", help="accurate or fast."),
+    ffmpeg_threads: int = typer.Option(
+        1,
+        "--ffmpeg-threads",
+        min=1,
+        help="Threads passed to each ffmpeg process. Lower values reduce CPU contention.",
+    ),
     subtitle_padding: int = typer.Option(120, "--subtitle-padding", help="Padding around subtitle segments in milliseconds."),
     merge_gap: int = typer.Option(220, "--merge-gap", help="Merge adjacent segments separated by at most this many milliseconds."),
     silence_threshold: int = typer.Option(-35, "--silence-threshold", help="Fallback silence threshold in dB."),
@@ -45,6 +52,7 @@ def run(
     """Process one or more audio files."""
     try:
         check_dependencies()
+        processing_mode = normalize_processing_mode(mode)
     except CondenserError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1)
@@ -65,6 +73,8 @@ def run(
             output_dir=output_dir.expanduser(),
             output_format=None if format.strip().lower() == "auto" else format.strip().lower(),
             subtitle_path=srt.expanduser() if srt is not None and index == 0 else None,
+            processing_mode=processing_mode,
+            ffmpeg_threads=ffmpeg_threads,
             subtitle_padding_ms=subtitle_padding,
             merge_gap_ms=merge_gap,
             silence_threshold_db=silence_threshold,
